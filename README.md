@@ -1,9 +1,9 @@
 # 01_preprocessing
 
-Three-stage preprocessing pipeline that turns the raw aircraft database and
+Four-stage preprocessing pipeline that turns the raw aircraft database and
 raw OpenSky ADS-B state-vector files into a homogeneous, filtered dataset of
 **conventional, light, fixed-wing General Aviation aircraft and their
-per-flight trajectory segments**, for use as a light-GA motion-prior
+uniformly-sampled flight trajectories**, for use as a light-GA motion-prior
 training set.
 
 ## Structure
@@ -11,14 +11,16 @@ training set.
 ```
 01_preprocessing/
 ├── scripts/
-│   ├── 01_preprocessing.py     # stage 1 entry point: aircraft DB -> GA whitelist
-│   ├── 02_state_filtering.py   # stage 2 entry point: state vectors -> filtered daily files
-│   └── 03_trajectory_prep.py   # stage 3 entry point: daily files -> trajectory segments
+│   ├── 01_preprocessing.py           # stage 1: aircraft DB -> GA whitelist
+│   ├── 02_state_filtering.py         # stage 2: state vectors -> filtered daily files
+│   ├── 03_trajectory_prep.py         # stage 3: daily files -> trajectory segments
+│   └── 04_resample_trajectories.py   # stage 4: segments -> uniform 10s trajectories
 └── utils/
-    ├── io.py                    # input/output path resolution for all stages
-    ├── ga_classification.py     # stage 1 rules: manufacturer/model classification
-    ├── state_filtering.py       # stage 2 rules: discovery, validation, filtering, sorting
-    └── trajectory_prep.py       # stage 3 rules: cleaning, segmentation, filtering
+    ├── io.py                          # input/output path resolution for all stages
+    ├── ga_classification.py           # stage 1 rules: manufacturer/model classification
+    ├── state_filtering.py             # stage 2 rules: discovery, validation, filtering, sorting
+    ├── trajectory_prep.py             # stage 3 rules: cleaning, segmentation, filtering
+    └── resample_trajectories.py       # stage 4 rules: gap splitting, interpolation, motion checks
 ```
 
 ## Usage
@@ -29,6 +31,7 @@ Run the stages in order — each depends on the previous stage's output:
 python 01_preprocessing/scripts/01_preprocessing.py
 python 01_preprocessing/scripts/02_state_filtering.py
 python 01_preprocessing/scripts/03_trajectory_prep.py
+python 01_preprocessing/scripts/04_resample_trajectories.py
 ```
 
 All can be run from any working directory — paths are resolved relative to
@@ -224,12 +227,130 @@ spot-check of 3 random segments' implied-speed distribution, and an anchor
 check that the combined median reported velocity falls in the expected
 45–75 m/s range for light GA cruise.
 
+---
+
+## Stage 4 — `04_resample_trajectories.py`
+
+Resamples stage 3's cleaned segments onto a uniform 10-second grid,
+producing per-day trajectory CSVs ready for later ENU conversion and
+dataset construction. This stage does **not** split train/test, normalize,
+build ML windows, heading-align, or emit ENU tensors — those belong to
+stage 5.
+
+```bash
+python 01_preprocessing/scripts/04_resample_trajectories.py
+python 01_preprocessing/scripts/04_resample_trajectories.py --dt 5 --smooth
+```
+
+CLI flags: `--dt` (default 10s), `--max-interp-gap-s` (default 30s),
+`--min-duration-s` (default 300s), `--min-points` (default 30),
+`--max-speed-mps` (default ~154.33, i.e. 300 kt — aligned with stage 3's
+glitch threshold so the two stages agree about the same physics),
+`--max-accel-mps2` (default 10), `--max-turn-rate-deg-s` (default 6),
+`--smooth` (off by default), `--input-dir` (default:
+`data/active/segments`), and `--output-dir` (default:
+`data/active/trajectories_10s`; the summary and audit CSVs are written
+alongside the trajectory files).
+
+- **Input:** every `states_*_conventionalGA_segments.csv` in
+  `data/active/segments/` (stage 3's output)
+- **Output:** `data/active/trajectories_10s/states_YYYY-MM-DD_conventionalGA_trajectories_10s.csv`,
+  one per day, plus `trajectory_resample_summary.csv` (one row per day) and
+  `trajectory_resample_dropped.csv` (audit trail: every dropped trajectory's
+  id, source segment, drop reason, and size — so filter losses, especially
+  maneuver-rich flights hitting the turn-rate rule, can be inspected rather
+  than vanishing silently). Original segment files are never modified.
+
+### Method
+
+For each day (`utils/resample_trajectories.py::process_day`), per `segment_id`:
+
+1. **Sort and deduplicate** — points are sorted by the canonical timestamp
+   (`lastposupdate`, falling back to `time`); duplicate timestamps within a
+   segment are dropped keeping the first. Segments left with fewer than 2
+   points are discarded.
+
+2. **Split at large gaps** — interpolation never bridges a time gap longer
+   than `--max-interp-gap-s` (default 30s). The segment is split at every
+   such gap and each resulting subsegment is resampled independently; the
+   `was_split_by_interp_gap` output flag records whether a split occurred.
+
+3. **Resample** — a uniform grid anchored at the subsegment's first
+   timestamp (`t_grid = start + arange(0, duration + 1e-9, dt)`) with
+   linear interpolation of `lat`/`lon`/`alt`. The grid never extends past
+   the last original point, so there is no extrapolation. Longitude is
+   unwrapped per subsegment before interpolating (and wrapped back to
+   [-180, 180) on output), so an antimeridian crossing interpolates
+   locally instead of sweeping across the planet. Linear interpolation is
+   deliberate: splines can overshoot around sparse maneuvers, and inventing
+   dynamics is worse than under-modeling them across a ≤30s hole. Each
+   sample also gets an `is_interpolated` flag (true when no real fix lies
+   within `dt/2` of the grid point) — synthetic samples inside a hole have
+   constant velocity by construction, and downstream analyses need to be
+   able to exclude them to avoid biasing a learned prior toward
+   straightness.
+
+4. **Optional light smoothing** — off by default; `--smooth` applies a
+   centered rolling median (window 3) to the interpolated positions.
+   Whether on or off, both `*_interp` and `*_smooth` columns are written
+   (identical when smoothing is off). Deliberately no Kalman/RTS smoother
+   yet — the `*_smooth` columns leave the seam for adding one later without
+   schema changes.
+
+5. **Motion quantities** — positions are converted to local flat-earth
+   metres relative to the trajectory's first point (E = R·cos(lat₀)·Δlon,
+   N = R·Δlat, R = 6,371,000 m) and differentiated on the grid.
+   `accel_mps2` is **longitudinal** (Δ|v|/dt) — near zero in a steady turn,
+   so the accel filter doesn't double-count turning flight that the
+   turn-rate filter already polices; `accel_vector_mps2` (|Δv⃗|/dt,
+   including the centripetal term) is also written for downstream
+   statistics but never filtered on. Heading differences are wrapped to
+   [-180°, 180°) before dividing by dt, so a track crossing north
+   (359°→1°) reads as 2°, not 358°. Backward differences mean the first
+   speed row copies the second, and the first two accel/turn-rate rows are
+   NaN — these NaNs are excluded from all checks. Reported ADS-B channels
+   (`velocity`, `heading`, `vertrate`) are interpolated onto the grid as
+   `*_interp` columns when present (heading via unwrap→interpolate→rewrap),
+   for reported-vs-derived cross-validation later.
+
+6. **Plausibility filters** — a resampled trajectory is dropped (counted
+   under its first failed rule, and logged to the audit CSV) if:
+   duration < `--min-duration-s`; samples < `--min-points`; **any** speed
+   > `--max-speed-mps`; more than 5% of |accel| values >
+   `--max-accel-mps2`; or more than 5% of |turn rate| values >
+   `--max-turn-rate-deg-s`. Note the dynamics limits police genuine
+   aggressive flight, not just errors (a steep pattern turn can reach
+   15–20 °/s) — the audit file exists precisely so those losses stay
+   inspectable.
+
+7. **Save** — one row per grid sample with identity (`icao24`, `callsign`,
+   `segment_id`, `trajectory_id` = `{segment_id}_r{k}` for the k-th
+   subsegment, `source_segment_id`), grid (`sample_idx`, `timestamp`,
+   `dt_s`), positions, provenance (`is_interpolated`), motion quantities,
+   reported channels, and segment/trajectory metadata. Aircraft metadata
+   columns (`manufacturername`, `model`, `icaoaircrafttype`,
+   `registration`, `typecode`) are carried through when present in the
+   input.
+
+After all days are processed, a **validation gate** runs and raises an
+error on failure. Hard checks are the genuinely independent ones: at least
+one output file exists; every within-trajectory step equals `dt` (via
+`np.isclose` — float grids from `arange` aren't exactly equal); no
+surviving trajectory violates the duration or sample-count minimums; and
+the combined median speed lands in 25–90 m/s. The p50/p95/p99 table for
+speed / |accel| / |accel_vec| / |turn rate| is **report-only** — asserting
+p95 < threshold would be circular, since the filters just enforced ~p95
+compliance at those exact values. It ends with a 3-trajectory random
+spot-check.
+
 ## Extending
 
 Each stage's rules live entirely in its own `utils/` module —
 `ga_classification.py` for stage 1, `state_filtering.py` for stage 2,
 `trajectory_prep.py` for stage 3 (edit the constants at its top:
 `FRESHNESS_MAX_LAG_S`, `MAX_SPEED_KNOTS`, `MAX_GLITCH_PASSES`,
-`PERSISTENT_VIOLATION_FRACTION`, `MIN_VELOCITY_MPS`, altitude bounds). Edit
-those directly; `io.py` and the entry-point scripts only need to change if
-the underlying file/folder layout changes.
+`PERSISTENT_VIOLATION_FRACTION`, `MIN_VELOCITY_MPS`, altitude bounds), and
+`resample_trajectories.py` for stage 4 (thresholds arrive via the CLI; the
+shared 5% violation allowance is `MAX_VIOLATION_FRACTION`). Edit those
+directly; `io.py` and the entry-point scripts only need to change if the
+underlying file/folder layout changes.

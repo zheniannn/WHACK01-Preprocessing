@@ -51,3 +51,20 @@ def get_segments_dir() -> str:
 def get_summary_path(output_dir: str = "") -> str:
     """Path to the cross-day trajectory-prep summary CSV (kept next to the segment files)."""
     return os.path.join(output_dir or get_segments_dir(), "trajectory_prep_summary.csv")
+
+
+# --- Stage 4 (04_resample_trajectories.py): segments -> uniform 10 s trajectories ---
+
+def get_trajectories_dir() -> str:
+    """Directory for the per-day uniform-grid trajectory CSVs and their summary."""
+    return os.path.join(get_project_root(), "data", "active", "trajectories_10s")
+
+
+def get_resample_summary_path(output_dir: str = "") -> str:
+    """Path to the cross-day resampling summary CSV (kept next to the trajectory files)."""
+    return os.path.join(output_dir or get_trajectories_dir(), "trajectory_resample_summary.csv")
+
+
+def get_dropped_audit_path(output_dir: str = "") -> str:
+    """Path to the dropped-trajectory audit CSV (kept next to the trajectory files)."""
+    return os.path.join(output_dir or get_trajectories_dir(), "trajectory_resample_dropped.csv")
