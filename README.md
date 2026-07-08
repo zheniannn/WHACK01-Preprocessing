@@ -1,4 +1,4 @@
-# 01_preprocessing
+# F01-Preprocessing
 
 Four-stage preprocessing pipeline that turns the raw aircraft database and
 raw OpenSky ADS-B state-vector files into a homogeneous, filtered dataset of
@@ -9,7 +9,7 @@ training set.
 ## Structure
 
 ```
-01_preprocessing/
+F01-Preprocessing/
 ├── scripts/
 │   ├── 01_preprocessing.py           # stage 1: aircraft DB -> GA whitelist
 │   ├── 02_state_filtering.py         # stage 2: state vectors -> filtered daily files
@@ -28,10 +28,10 @@ training set.
 Run the stages in order — each depends on the previous stage's output:
 
 ```bash
-python 01_preprocessing/scripts/01_preprocessing.py
-python 01_preprocessing/scripts/02_state_filtering.py
-python 01_preprocessing/scripts/03_trajectory_prep.py
-python 01_preprocessing/scripts/04_resample_trajectories.py
+python F01-Preprocessing/scripts/01_preprocessing.py
+python F01-Preprocessing/scripts/02_state_filtering.py
+python F01-Preprocessing/scripts/03_trajectory_prep.py
+python F01-Preprocessing/scripts/04_resample_trajectories.py
 ```
 
 All can be run from any working directory — paths are resolved relative to
@@ -141,8 +141,8 @@ removes bad/stale points and splits each aircraft's daily point stream into
 physically-plausible flight segments, ready for those later stages.
 
 ```bash
-python 01_preprocessing/scripts/03_trajectory_prep.py
-python 01_preprocessing/scripts/03_trajectory_prep.py --gap-split 90 --min-points 30
+python F01-Preprocessing/scripts/03_trajectory_prep.py
+python F01-Preprocessing/scripts/03_trajectory_prep.py --gap-split 90 --min-points 30
 ```
 
 CLI flags: `--gap-split` (default 60s), `--min-duration` (default 300s),
@@ -241,8 +241,8 @@ build ML windows, heading-align, or emit ENU tensors — those belong to
 stage 5.
 
 ```bash
-python 01_preprocessing/scripts/04_resample_trajectories.py
-python 01_preprocessing/scripts/04_resample_trajectories.py --dt 5 --smooth
+python F01-Preprocessing/scripts/04_resample_trajectories.py
+python F01-Preprocessing/scripts/04_resample_trajectories.py --dt 5 --smooth
 ```
 
 CLI flags: `--dt` (default 10s), `--max-interp-gap-s` (default 30s),

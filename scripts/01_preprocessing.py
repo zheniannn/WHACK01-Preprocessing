@@ -3,7 +3,7 @@ General Aviation aircraft (see utils/ga_classification.py for the rules) and
 write the result to data/active/.
 
 Usage:
-    python 01_preprocessing/scripts/01_preprocessing.py
+    python F01-Preprocessing/scripts/01_preprocessing.py
 """
 
 import os

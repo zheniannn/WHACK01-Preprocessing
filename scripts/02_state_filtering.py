@@ -3,7 +3,7 @@ conventional-GA aircraft whitelist, then concatenate and sort into one
 sorted CSV per day.
 
 Usage:
-    python 01_preprocessing/scripts/02_state_filtering.py
+    python F01-Preprocessing/scripts/02_state_filtering.py
 """
 
 import os

@@ -6,8 +6,8 @@ tensor output happens here -- see utils/resample_trajectories.py for exactly
 what this stage does and does not do.
 
 Usage:
-    python 01_preprocessing/scripts/04_resample_trajectories.py
-    python 01_preprocessing/scripts/04_resample_trajectories.py --dt 5 --smooth
+    python F01-Preprocessing/scripts/04_resample_trajectories.py
+    python F01-Preprocessing/scripts/04_resample_trajectories.py --dt 5 --smooth
 """
 
 import argparse

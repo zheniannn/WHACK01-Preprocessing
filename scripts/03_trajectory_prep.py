@@ -5,8 +5,8 @@ No ENU conversion and no training-window construction happen here -- see
 utils/trajectory_prep.py for exactly what this stage does and does not do.
 
 Usage:
-    python 01_preprocessing/scripts/03_trajectory_prep.py
-    python 01_preprocessing/scripts/03_trajectory_prep.py --gap-split 90 --min-points 30
+    python F01-Preprocessing/scripts/03_trajectory_prep.py
+    python F01-Preprocessing/scripts/03_trajectory_prep.py --gap-split 90 --min-points 30
 """
 
 import argparse
