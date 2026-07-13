@@ -1,10 +1,9 @@
 """Clean and segment daily sorted conventional-GA ADS-B state vectors into
 per-flight trajectory segments.
 
-This stage does NOT do ENU conversion and does NOT build training windows --
-it only removes bad/stale points and splits each aircraft's daily point
-stream into physically-plausible flight segments, ready for those later
-stages.
+This stage removes bad/stale points and splits each aircraft's daily point
+stream into physically-plausible flight segments; it performs no coordinate
+conversion and no windowing.
 
 Pipeline per day (see process_day):
   read (chunked) with per-chunk freshness filter -> concatenate
@@ -45,7 +44,7 @@ MIN_VELOCITY_MPS = 15.0                              # drops airborne-flagged id
 EARTH_RADIUS_M = 6_371_000.0
 
 REQUIRED_BASE_COLUMNS = ["icao24", "lat", "lon", "onground"]
-ALTITUDE_CANDIDATES = ["geoaltitude", "baroaltitude"]  # geoaltitude preferred (GPS-based; needed for slant range later)
+ALTITUDE_CANDIDATES = ["geoaltitude", "baroaltitude"]  # geoaltitude preferred (GPS-based)
 
 # Force these to string dtype on every read: a sorted file's early rows can be
 # all-numeric hex codes (e.g. icao24 "111111"), which would otherwise make
@@ -55,7 +54,7 @@ READ_DTYPE_OVERRIDES = {"icao24": str, "callsign": str}
 
 
 # =============================================================================
-# Helper functions (required names per spec)
+# Helpers
 # =============================================================================
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -180,9 +179,8 @@ def basic_clean(
     df = df[~is_ground]
     log("on-ground rows", n0 - len(df), n0)
 
-    # Coalesce altitude: geoaltitude preferred (GPS-based; needed for slant
-    # range later), falling back to baroaltitude where geoaltitude is missing.
-    # Both original columns are kept untouched in the output.
+    # Coalesce altitude: geoaltitude preferred (GPS-based), falling back to
+    # baroaltitude where missing. Both original columns are kept untouched.
     n0 = len(df)
     if geo_col and baro_col:
         alt = df[geo_col].where(df[geo_col].notna(), df[baro_col])
@@ -338,10 +336,19 @@ def remove_glitch_points(df: pd.DataFrame, timestamp_col: str) -> Tuple[pd.DataF
     return df[keep_mask].reset_index(drop=True), points_removed, segments_discarded
 
 
-def filter_valid_segments(df: pd.DataFrame, min_duration_s: float, min_points: int) -> pd.DataFrame:
+def filter_valid_segments(
+    df: pd.DataFrame,
+    min_duration_s: float,
+    min_points: int,
+    min_velocity_mps: float = MIN_VELOCITY_MPS,
+) -> pd.DataFrame:
     """Keep only segments that are long enough, dense enough, and (if a
     velocity column exists) fast enough in the median to be real flight
     rather than an on-the-ground/taxi artifact that slipped past onground.
+
+    min_velocity_mps is tunable (CLI --min-median-velocity): the default 15
+    biases the dataset toward cruise -- lower it to retain slow-flight
+    regimes (pattern work, approaches) when those matter downstream.
 
     Point counts and median velocity are recomputed on the post-glitch-removal
     rows; duration deliberately uses the stored segment_duration_s from
@@ -356,7 +363,7 @@ def filter_valid_segments(df: pd.DataFrame, min_duration_s: float, min_points: i
 
     if "velocity" in df.columns:
         median_velocity = grouped["velocity"].transform("median")
-        keep = keep & (median_velocity >= MIN_VELOCITY_MPS)
+        keep = keep & (median_velocity >= min_velocity_mps)
 
     return df[keep].reset_index(drop=True)
 
@@ -412,6 +419,7 @@ def process_day(
     gap_split_s: float,
     min_duration_s: float,
     min_points: int,
+    min_velocity_mps: float = MIN_VELOCITY_MPS,
 ) -> Dict:
     """Run the full freshness -> clean -> dedupe -> segment -> glitch-removal
     -> filter -> save pipeline for one day. Returns the summary dict for this
@@ -441,7 +449,7 @@ def process_day(
     df_segmented = assign_segments(df_clean, timestamp_col, gap_split_s)
     df_glitch_free, rows_removed_glitch_points, segments_discarded = remove_glitch_points(df_segmented, timestamp_col)
 
-    df_final = filter_valid_segments(df_glitch_free, min_duration_s, min_points)
+    df_final = filter_valid_segments(df_glitch_free, min_duration_s, min_points, min_velocity_mps)
     rows_after_segmentation = len(df_final)
     rows_removed_short_segments = len(df_glitch_free) - rows_after_segmentation
 

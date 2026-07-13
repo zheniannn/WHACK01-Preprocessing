@@ -1,22 +1,21 @@
-# F01-Preprocessing
-
-> Part of the PLSWORK light-GA radar pipeline: [F01-Preprocessing](https://github.com/zheniannn/F01-Preprocessing) (stages 1-4) → [F02-Radar](https://github.com/zheniannn/F02-Radar) (stages 5-6) → [F03-Evaluation](https://github.com/zheniannn/F03-Evaluation) (stages 7-9).
+# WHACK01-Preprocessing
 
 Four-stage preprocessing pipeline that turns the raw aircraft database and
 raw OpenSky ADS-B state-vector files into a homogeneous, filtered dataset of
 **conventional, light, fixed-wing General Aviation aircraft and their
-uniformly-sampled flight trajectories**, for use as a light-GA motion-prior
-training set.
+uniformly-sampled flight trajectories** — ground-truth tracks for light-GA
+motion modelling.
 
 ## Structure
 
 ```
-F01-Preprocessing/
+WHACK01-Preprocessing/
+├── requirements.txt
 ├── scripts/
 │   ├── 01_preprocessing.py           # stage 1: aircraft DB -> GA whitelist
 │   ├── 02_state_filtering.py         # stage 2: state vectors -> filtered daily files
 │   ├── 03_trajectory_prep.py         # stage 3: daily files -> trajectory segments
-│   └── 04_resample_trajectories.py   # stage 4: segments -> uniform 10s trajectories
+│   └── 04_resample_trajectories.py   # stage 4: segments -> uniform-grid trajectories
 └── utils/
     ├── io.py                          # input/output path resolution for all stages
     ├── ga_classification.py           # stage 1 rules: manufacturer/model classification
@@ -25,19 +24,45 @@ F01-Preprocessing/
     └── resample_trajectories.py       # stage 4 rules: gap splitting, interpolation, motion checks
 ```
 
+## Requirements
+
+Python ≥ 3.10 with `pandas` and `numpy`:
+
+```bash
+pip install -r requirements.txt
+```
+
+## Data layout
+
+Data lives outside the repository. By default the pipeline reads and writes
+a `data/` directory **next to** the repo; set the `WHACK_DATA_ROOT`
+environment variable to point anywhere else.
+
+```
+<data root>/
+├── archive/               # raw inputs, never modified
+│   ├── aircraftDatabase-2022-06.csv
+│   └── states_YYYY-MM-DD-HH.csv      # hourly OpenSky state-vector dumps
+└── active/                # everything the pipeline writes
+    ├── states/            # stage 2 output
+    ├── segments/          # stage 3 output
+    └── trajectories_10s/  # stage 4 output (dir name follows --dt)
+```
+
 ## Usage
 
 Run the stages in order — each depends on the previous stage's output:
 
 ```bash
-python F01-Preprocessing/scripts/01_preprocessing.py
-python F01-Preprocessing/scripts/02_state_filtering.py
-python F01-Preprocessing/scripts/03_trajectory_prep.py
-python F01-Preprocessing/scripts/04_resample_trajectories.py
+python scripts/01_preprocessing.py
+python scripts/02_state_filtering.py
+python scripts/03_trajectory_prep.py
+python scripts/04_resample_trajectories.py
 ```
 
 All can be run from any working directory — paths are resolved relative to
-the project root, not the shell's cwd.
+the repository, not the shell's cwd. Every script also accepts explicit
+input/output path overrides (see `--help`).
 
 ---
 
@@ -45,13 +70,14 @@ the project root, not the shell's cwd.
 
 Filters the full aircraft database down to conventional GA aircraft.
 
-- **Input:** `data/archive/aircraftDatabase-2022-06.csv`
-- **Output:** `data/active/aircraftDatabase-2022-06-conventionalGA.csv`
-  (overwritten on each run; all original columns are preserved unchanged)
+- **Input:** `archive/aircraftDatabase-2022-06.csv` (override: `--input`)
+- **Output:** `active/aircraftDatabase-2022-06-conventionalGA.csv`
+  (override: `--output`; overwritten on each run; all original columns are
+  preserved unchanged)
 
-Prints six lines: total input rows, rows kept by the base manufacturer/model
-rules, rows removed by the stricter homogeneity rules, rows removed for a
-malformed `icao24`, final row count, and the output file's absolute path.
+Prints a labelled summary: total input rows, rows matched by the base
+manufacturer/model rules, rows removed by the stricter homogeneity rules,
+rows removed for a malformed `icao24`, rows kept, and the output path.
 
 ### Method
 
@@ -97,14 +123,16 @@ Filters raw OpenSky ADS-B state-vector files down to the conventional-GA
 aircraft whitelist produced by stage 1, then concatenates and sorts them
 into one file per day.
 
-- **Whitelist:** `data/active/aircraftDatabase-2022-06-conventionalGA.csv`
-  (its `icao24` column; matched case-insensitively)
-- **Input:** every `*.csv` in `data/archive/` whose filename contains a
-  `YYYY-MM-DD` date, except the aircraft database files themselves and any
-  file already named with `conventionalGA`, `sorted`, or `filtered`
-- **Output:** `data/active/states/states_YYYY-MM-DD_conventionalGA_sorted.csv`,
-  one per date, overwritten on each run; all original ADS-B columns and
-  values are preserved (only row order and row membership change)
+- **Whitelist:** `active/aircraftDatabase-2022-06-conventionalGA.csv`
+  (its `icao24` column; matched case-insensitively; override: `--whitelist`)
+- **Input:** every `*.csv` in `archive/` (override: `--state-dir`) whose
+  filename contains a `YYYY-MM-DD` date, except the aircraft database files
+  themselves and any file already named with `conventionalGA`, `sorted`, or
+  `filtered`
+- **Output:** `active/states/states_YYYY-MM-DD_conventionalGA_sorted.csv`
+  (override: `--output-dir`), one per date, overwritten on each run; all
+  original ADS-B columns and values are preserved (only row order and row
+  membership change)
 
 ### Method
 
@@ -137,25 +165,27 @@ as a hard failure:
 ## Stage 3 — `03_trajectory_prep.py`
 
 Cleans and segments the daily sorted conventional-GA state-vector files
-(stage 2's output) into per-flight trajectory segments. This stage does
-**not** do ENU conversion and does **not** build training windows — it only
-removes bad/stale points and splits each aircraft's daily point stream into
-physically-plausible flight segments, ready for those later stages.
+(stage 2's output) into per-flight trajectory segments: removes bad/stale
+points, then splits each aircraft's daily point stream into
+physically-plausible flight segments.
 
 ```bash
-python F01-Preprocessing/scripts/03_trajectory_prep.py
-python F01-Preprocessing/scripts/03_trajectory_prep.py --gap-split 90 --min-points 30
+python scripts/03_trajectory_prep.py
+python scripts/03_trajectory_prep.py --gap-split 90 --min-points 30
 ```
 
 CLI flags: `--gap-split` (default 60s), `--min-duration` (default 300s),
-`--min-points` (default 20), `--input-dir` (default: this project's
-`data/active/states`), and `--output-dir` (default: `data/active/segments`;
-the summary CSV is written alongside the segment files).
+`--min-points` (default 20), `--min-median-velocity` (default 15 m/s — the
+segment-level median reported-velocity floor; the default biases toward
+cruise, lower it to retain slow-flight regimes like pattern work and
+approaches), `--input-dir` (default: `active/states`), and `--output-dir`
+(default: `active/segments`; the summary CSV is written alongside the
+segment files).
 
-- **Input:** every `states_*_conventionalGA_sorted.csv` in `data/active/states/`
+- **Input:** every `states_*_conventionalGA_sorted.csv` in `active/states/`
   (stage 2's output); files already containing `_segments` are ignored
-- **Output:** `data/active/segments/states_YYYY-MM-DD_conventionalGA_segments.csv`,
-  one per day, plus `data/active/segments/trajectory_prep_summary.csv`
+- **Output:** `active/segments/states_YYYY-MM-DD_conventionalGA_segments.csv`,
+  one per day, plus `active/segments/trajectory_prep_summary.csv`
   summarizing all days. Original sorted inputs are never modified.
 
 ### Method
@@ -236,35 +266,40 @@ check that the combined median reported velocity falls in the expected
 
 ## Stage 4 — `04_resample_trajectories.py`
 
-Resamples stage 3's cleaned segments onto a uniform 10-second grid,
-producing per-day trajectory CSVs ready for later ENU conversion and
-dataset construction. This stage does **not** split train/test, normalize,
-build ML windows, heading-align, or emit ENU tensors — those belong to
-stage 5.
+Resamples stage 3's cleaned segments onto a uniform time grid (default
+10 s), producing per-day trajectory CSVs.
 
 ```bash
-python F01-Preprocessing/scripts/04_resample_trajectories.py
-python F01-Preprocessing/scripts/04_resample_trajectories.py --dt 5 --smooth
+python scripts/04_resample_trajectories.py
+python scripts/04_resample_trajectories.py --dt 5 --smooth
+python scripts/04_resample_trajectories.py --dt 4   # radar scan period
 ```
+
+Outputs are tagged with the grid spacing (`--dt 4` writes
+`active/trajectories_4s/…_trajectories_4s.csv`), so products at
+different sampling periods coexist. To simulate a radar with a different
+scan period, **rerun this stage from the stage-3 segments** — never
+resample an existing gridded product a second time, which would compound
+the interpolation low-pass.
 
 CLI flags: `--dt` (default 10s), `--max-interp-gap-s` (default 30s),
 `--min-duration-s` (default 300s), `--min-points` (default 30),
 `--max-speed-mps` (default ~154.33, i.e. 300 kt — aligned with stage 3's
 glitch threshold so the two stages agree about the same physics),
 `--max-accel-mps2` (default 10), `--max-turn-rate-deg-s` (default 6),
-`--smooth` (off by default), `--input-dir` (default:
-`data/active/segments`), and `--output-dir` (default:
-`data/active/trajectories_10s`; the summary and audit CSVs are written
-alongside the trajectory files).
+`--drop-dynamics` (off by default — see plausibility filters below),
+`--smooth` (off by default), `--input-dir` (default: `active/segments`),
+and `--output-dir` (default: `active/trajectories_<dt>s`; the summary and
+audit CSVs are written alongside the trajectory files).
 
 - **Input:** every `states_*_conventionalGA_segments.csv` in
-  `data/active/segments/` (stage 3's output)
-- **Output:** `data/active/trajectories_10s/states_YYYY-MM-DD_conventionalGA_trajectories_10s.csv`,
+  `active/segments/` (stage 3's output)
+- **Output:** `active/trajectories_<dt>s/states_YYYY-MM-DD_conventionalGA_trajectories_<dt>s.csv`,
   one per day, plus `trajectory_resample_summary.csv` (one row per day) and
   `trajectory_resample_dropped.csv` (audit trail: every dropped trajectory's
-  id, source segment, drop reason, and size — so filter losses, especially
-  maneuver-rich flights hitting the turn-rate rule, can be inspected rather
-  than vanishing silently). Original segment files are never modified.
+  id, source segment, drop reason, and size — so filter losses can be
+  inspected rather than vanishing silently). Original segment files are
+  never modified.
 
 ### Method
 
@@ -316,19 +351,35 @@ For each day (`utils/resample_trajectories.py::process_day`), per `segment_id`:
    NaN — these NaNs are excluded from all checks. Reported ADS-B channels
    (`velocity`, `heading`, `vertrate`) are interpolated onto the grid as
    `*_interp` columns when present (heading via unwrap→interpolate→rewrap),
-   for reported-vs-derived cross-validation later.
+   so reported values can be cross-checked against derived ones.
 
-6. **Plausibility filters** — a resampled trajectory is dropped (counted
-   under its first failed rule, and logged to the audit CSV) if:
-   duration < `--min-duration-s`; samples < `--min-points`; **any** speed
-   > `--max-speed-mps`; more than 5% of |accel| values >
-   `--max-accel-mps2`; or more than 5% of |turn rate| values >
-   `--max-turn-rate-deg-s`. Note the dynamics limits police genuine
-   aggressive flight, not just errors (a steep pattern turn can reach
-   15–20 °/s) — the audit file exists precisely so those losses stay
-   inspectable.
+6. **Plausibility filters** — a resampled trajectory is **dropped** (counted
+   under its first failed rule, and logged to the audit CSV) only for the
+   rules that mark it unusable or glitch-corrupted: duration <
+   `--min-duration-s`; samples < `--min-points`; **any** speed >
+   `--max-speed-mps`. The dynamics rules — more than 5% of |accel| values >
+   `--max-accel-mps2`, or more than 5% of |turn rate| values >
+   `--max-turn-rate-deg-s` — **flag** the trajectory instead
+   (`exceeds_accel_limit` / `exceeds_turn_rate_limit` columns, `flagged_*`
+   summary counts): they police genuine aggressive flight, not errors (a
+   steep pattern turn can reach 15–20 °/s), and dropping those flights
+   would bias the dataset toward benign, steady motion — the wrong prior
+   for discriminating real maneuvering targets from clutter. Pass
+   `--drop-dynamics` to restore hard dropping.
 
-7. **Save** — one row per grid sample with identity (`icao24`, `callsign`,
+7. **Native-rate dynamics** — grid-derived motion is low-passed by the
+   linear interpolation (at ~55 m/s, a 6 °/s turn sweeps 60° between 10 s
+   samples), so each grid sample also carries the dynamics of the RAW
+   fixes in its interval, computed before any resampling:
+   `raw_speed_max_mps`, `raw_accel_max_mps2`, `raw_turn_rate_max_deg_s`
+   (max |·| over raw inter-fix steps whose midpoint falls in
+   `(t[i-1], t[i]]`; NaN where the interval holds no raw step — consistent
+   with `is_interpolated`), `n_raw_fixes` (raw fixes per interval), and
+   `raw_update_median_s` (per-trajectory median raw update spacing, a local
+   fidelity indicator). Downstream should treat these, not the grid
+   differences, as truth for maneuver intensity.
+
+8. **Save** — one row per grid sample with identity (`icao24`, `callsign`,
    `segment_id`, `trajectory_id` = `{segment_id}_r{k}` for the k-th
    subsegment, `source_segment_id`), grid (`sample_idx`, `timestamp`,
    `dt_s`), positions, provenance (`is_interpolated`), motion quantities,
@@ -336,7 +387,7 @@ For each day (`utils/resample_trajectories.py::process_day`), per `segment_id`:
    `segment_start/end_time` fields describe the *parent stage-3 segment*
    (provenance); `trajectory_start_time` / `trajectory_end_time` /
    `trajectory_duration_s` describe *this resampled subsegment* and are
-   what downstream stages should use. Aircraft metadata columns
+   the ones consumers should use. Aircraft metadata columns
    (`manufacturername`, `model`, `icaoaircrafttype`, `registration`,
    `typecode`) are carried through when present in the input.
 

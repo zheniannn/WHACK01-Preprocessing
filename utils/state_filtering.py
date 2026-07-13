@@ -27,7 +27,7 @@ def load_whitelist(whitelist_path: str) -> Set[str]:
     if not os.path.exists(whitelist_path):
         raise FileNotFoundError(f"Aircraft whitelist not found: {whitelist_path}")
 
-    whitelist_df = pd.read_csv(whitelist_path, usecols=None, low_memory=False)
+    whitelist_df = pd.read_csv(whitelist_path, low_memory=False)
     if "icao24" not in whitelist_df.columns:
         raise ValueError(f"Whitelist file is missing required column 'icao24': {whitelist_path}")
 
@@ -107,21 +107,18 @@ def validate_state_file(path: str) -> Optional[str]:
 
 
 def filter_state_file(path: str, whitelist: Set[str]) -> Tuple[pd.DataFrame, int]:
-    """Read path in chunks, drop blank icao24 rows, and keep only whitelisted
-    aircraft (case-insensitive). Returns (filtered_rows_df, rows_read)."""
+    """Read path in chunks and keep only whitelisted aircraft (case-insensitive).
+
+    Blank/NaN icao24 rows can never match the whitelist (it contains no empty
+    values), so a single isin() covers them too. Returns (filtered_df, rows_read).
+    """
     rows_read = 0
     kept_chunks = []
 
     for chunk in pd.read_csv(path, chunksize=CHUNK_SIZE, low_memory=False):
         rows_read += len(chunk)
-
-        icao24_raw = chunk["icao24"]
-        non_blank = icao24_raw.notna() & (icao24_raw.astype(str).str.strip() != "")
-        chunk = chunk[non_blank]
-
-        icao24_lower = chunk["icao24"].astype(str).str.strip().str.lower()
-        chunk = chunk[icao24_lower.isin(whitelist)]
-
+        icao24 = chunk["icao24"].astype(str).str.strip().str.lower()
+        chunk = chunk[icao24.isin(whitelist)]
         if not chunk.empty:
             kept_chunks.append(chunk)
 

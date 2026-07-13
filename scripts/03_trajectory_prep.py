@@ -1,12 +1,10 @@
-"""Entry point: clean and segment the daily sorted conventional-GA ADS-B
-state-vector files into per-flight trajectory segments.
-
-No ENU conversion and no training-window construction happen here -- see
-utils/trajectory_prep.py for exactly what this stage does and does not do.
+"""Stage 3: clean and segment the daily sorted conventional-GA ADS-B
+state-vector files into per-flight trajectory segments (rules in
+utils/trajectory_prep.py).
 
 Usage:
-    python F01-Preprocessing/scripts/03_trajectory_prep.py
-    python F01-Preprocessing/scripts/03_trajectory_prep.py --gap-split 90 --min-points 30
+    python scripts/03_trajectory_prep.py
+    python scripts/03_trajectory_prep.py --gap-split 90 --min-points 30
 """
 
 import argparse
@@ -51,6 +49,10 @@ def parse_args():
                          help="Minimum segment duration in seconds to keep (default: 300).")
     parser.add_argument("--min-points", type=int, default=20,
                          help="Minimum number of points a segment must have to keep (default: 20).")
+    parser.add_argument("--min-median-velocity", type=float, default=15.0,
+                         help="Minimum median reported velocity in m/s for a segment to be kept "
+                              "(default: 15, which biases toward cruise; lower it to retain "
+                              "slow-flight regimes like pattern work and approaches).")
     return parser.parse_args()
 
 
@@ -178,7 +180,8 @@ def main() -> None:
 
     day_results = []
     for date, input_path in day_files:
-        result = process_day(date, input_path, output_dir, args.gap_split, args.min_duration, args.min_points)
+        result = process_day(date, input_path, output_dir, args.gap_split, args.min_duration,
+                             args.min_points, args.min_median_velocity)
         day_results.append(result)
 
         print(f"\n--- {result['date']} ---")

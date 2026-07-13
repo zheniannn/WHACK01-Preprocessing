@@ -1,9 +1,8 @@
 """Resample cleaned trajectory segments onto a uniform time grid.
 
 Stage 4 consumes stage 3's per-flight segment CSVs and produces, per day,
-uniformly-sampled (default 10 s) trajectories ready for later ENU conversion
-and dataset construction. It does NOT split train/test, normalize, build ML
-windows, or emit ENU tensors -- those belong to stage 5.
+uniformly-sampled (default 10 s) trajectory CSVs. It performs no coordinate
+conversion, normalization, or windowing.
 
 Pipeline per day (see process_day):
   read segments -> per segment: sort, dedup timestamps, split at large gaps
@@ -19,7 +18,16 @@ Numerical care taken here, because each mistake silently poisons downstream:
   * accel_mps2 is longitudinal (d|v|/dt) -- near zero in a steady turn, so the
     accel filter doesn't double-count turning flight that the turn-rate filter
     already polices; the centripetal-inclusive magnitude is also written, as
-    accel_vector_mps2, for downstream statistics only (never filtered on).
+    accel_vector_mps2, for downstream statistics only (never filtered on);
+  * accel / turn-rate exceedances FLAG a trajectory rather than dropping it
+    (unless cfg.drop_dynamics) -- dropping would bias the dataset toward
+    benign, steady flight, exactly the wrong prior for discriminating real
+    maneuvering targets from clutter;
+  * grid-derived motion is low-passed by linear interpolation onto the grid,
+    so native-rate dynamics computed from the RAW fixes are carried alongside
+    (raw_speed_max_mps / raw_accel_max_mps2 / raw_turn_rate_max_deg_s per grid
+    interval, plus n_raw_fixes and raw_update_median_s) -- downstream should
+    treat those, not the grid differences, as the truth for maneuver intensity.
 """
 
 import os
@@ -30,10 +38,16 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from .io import dt_tag
+
 INPUT_PREFIX = "states_"
 INPUT_SUFFIX = "_conventionalGA_segments.csv"
-OUTPUT_SUFFIX = "_conventionalGA_trajectories_10s.csv"
 DATE_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+
+def output_suffix(dt_s: float) -> str:
+    """Per-day output filename suffix, tagged with the grid spacing (see io.dt_tag)."""
+    return f"_conventionalGA_trajectories_{dt_tag(dt_s)}.csv"
 
 TIMESTAMP_CANDIDATES = ["lastposupdate", "time"]   # lastposupdate preferred, as in stage 3
 
@@ -49,7 +63,7 @@ OPTIONAL_METADATA_COLUMNS = [
 ]
 
 # Reported ADS-B channels resampled onto the grid (as <name>_interp) when
-# present, for reported-vs-derived cross-validation and vertical rate later.
+# present, so reported values can be cross-checked against derived ones.
 REPORTED_CHANNELS = ["velocity", "heading", "vertrate"]
 
 EARTH_RADIUS_M = 6_371_000.0
@@ -57,11 +71,15 @@ KNOTS_TO_MPS = 0.514444
 MAX_SPEED_MPS_DEFAULT = 300.0 * KNOTS_TO_MPS   # ~154.33; aligned with stage 3's glitch threshold
 
 # Fraction of samples allowed to violate the accel / turn-rate limits before
-# the whole trajectory is dropped (mirrors stage 3's 5% rule).
+# the whole trajectory is flagged -- or dropped, under cfg.drop_dynamics
+# (mirrors stage 3's 5% rule).
 MAX_VIOLATION_FRACTION = 0.05
 
 # Drop-rule names, in the order they are checked; also the summary-counter keys.
+# duration/min_points/speed are always hard drops (unusable or glitch-corrupted
+# data); accel/turn_rate only drop under cfg.drop_dynamics, else they flag.
 DROP_REASONS = ["duration", "min_points", "speed", "accel", "turn_rate"]
+DYNAMICS_FLAGS = ["accel", "turn_rate"]
 
 
 @dataclass
@@ -75,6 +93,7 @@ class ResampleConfig:
     max_accel_mps2: float = 10.0
     max_turn_rate_deg_s: float = 6.0
     smooth: bool = False               # optional light smoothing, off by default
+    drop_dynamics: bool = False        # True restores pre-flag behavior: accel/turn-rate exceedances drop
 
 
 # =============================================================================
@@ -210,31 +229,113 @@ def compute_motion(t_grid, lat, lon_unwrapped, dt_s: float):
     return speed, accel, accel_vector, turn_rate
 
 
-def classify_trajectory(t_grid, speed, accel, turn_rate, cfg: ResampleConfig) -> Optional[str]:
-    """Return the first violated drop-rule name (see DROP_REASONS), or None
-    if the trajectory passes every plausibility filter.
+def raw_dynamics_per_interval(
+    t_grid: np.ndarray,
+    t_raw: np.ndarray,
+    lat_raw: np.ndarray,
+    lon_unwrapped_raw: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Native-rate motion aggregated onto the grid, from the RAW fixes.
 
-    Only longitudinal accel is filtered on -- see the module docstring.
+    Linear interpolation onto the grid low-passes the true dynamics (at
+    ~55 m/s a 6 deg/s turn sweeps 60 deg between 10 s samples), so the
+    grid-derived channels understate maneuver intensity. These channels
+    preserve it: for each grid sample i, over the interval
+    (t_grid[i-1], t_grid[i]], report the max |speed| / |accel| / |turn rate|
+    of the raw inter-fix steps whose midpoint time falls in that interval,
+    plus the raw-fix count. NaN where the interval contains no raw step
+    (i.e. the sample is synthetic -- consistent with is_interpolated).
+
+    Returns (raw_speed_max, raw_accel_max, raw_turn_rate_max, n_raw_fixes).
+    """
+    n = len(t_grid)
+    speed_max = np.full(n, np.nan)
+    accel_max = np.full(n, np.nan)
+    turn_max = np.full(n, np.nan)
+    n_fixes = np.zeros(n, dtype=int)
+
+    # side="left": a value at exactly t_grid[i] belongs to interval i.
+    fix_bins = np.clip(np.searchsorted(t_grid, t_raw, side="left"), 0, n - 1)
+    np.add.at(n_fixes, fix_bins, 1)
+
+    if len(t_raw) < 2:
+        return speed_max, accel_max, turn_max, n_fixes
+
+    # Per-step quantities at step-midpoint times (same flat-earth frame as
+    # compute_motion, but on the nonuniform raw timestamps).
+    dt = np.diff(t_raw)                              # > 0: timestamps are deduped upstream
+    lat0 = np.radians(lat_raw[0])
+    east = EARTH_RADIUS_M * np.cos(lat0) * np.radians(lon_unwrapped_raw - lon_unwrapped_raw[0])
+    north = EARTH_RADIUS_M * np.radians(lat_raw - lat_raw[0])
+    v_east = np.diff(east) / dt
+    v_north = np.diff(north) / dt
+    speed = np.hypot(v_east, v_north)
+    t_mid = (t_raw[:-1] + t_raw[1:]) / 2.0
+
+    def scatter_max(target: np.ndarray, times: np.ndarray, values: np.ndarray) -> None:
+        finite = np.isfinite(values)
+        if not finite.any():
+            return
+        bins = np.clip(np.searchsorted(t_grid, times[finite], side="left"), 0, n - 1)
+        acc = np.full(n, -np.inf)
+        np.maximum.at(acc, bins, np.abs(values[finite]))
+        seen = acc > -np.inf
+        target[seen] = acc[seen]
+
+    scatter_max(speed_max, t_mid, speed)
+
+    if len(speed) >= 2:
+        dt_mid = np.diff(t_mid)                      # > 0 since t_raw strictly increases
+        accel = np.diff(speed) / dt_mid
+        heading_deg = np.degrees(np.arctan2(v_east, v_north))
+        d_heading = (np.diff(heading_deg) + 180.0) % 360.0 - 180.0
+        turn = d_heading / dt_mid
+        t_mid2 = (t_mid[:-1] + t_mid[1:]) / 2.0
+        scatter_max(accel_max, t_mid2, accel)
+        scatter_max(turn_max, t_mid2, turn)
+
+    return speed_max, accel_max, turn_max, n_fixes
+
+
+def classify_trajectory(
+    t_grid, speed, accel, turn_rate, cfg: ResampleConfig
+) -> Tuple[Optional[str], Dict[str, bool]]:
+    """Return (hard_drop_reason_or_None, dynamics_flags).
+
+    duration / min_points / speed are always hard drops -- they mark a
+    trajectory as unusable or glitch-corrupted. accel / turn_rate
+    exceedances (>MAX_VIOLATION_FRACTION of samples over the limit) are
+    returned as flags and only become drops under cfg.drop_dynamics:
+    maneuver-rich flights are real targets, and silently removing them
+    would bias a motion prior toward benign, steady flight.
+
+    Only longitudinal accel is flagged on -- see the module docstring.
     NaNs (the warm-up rows of speed/accel/turn rate) are excluded from every
     check so they can never cause a false failure.
     """
+    flags = {name: False for name in DYNAMICS_FLAGS}
+
     if t_grid[-1] - t_grid[0] < cfg.min_duration_s:
-        return "duration"
+        return "duration", flags
     if len(t_grid) < cfg.min_points:
-        return "min_points"
+        return "min_points", flags
 
     finite_speed = speed[np.isfinite(speed)]
     if finite_speed.size and finite_speed.max() > cfg.max_speed_mps:
-        return "speed"
+        return "speed", flags
 
     for reason, values, limit in (
         ("accel", accel, cfg.max_accel_mps2),
         ("turn_rate", turn_rate, cfg.max_turn_rate_deg_s),
     ):
         finite = values[np.isfinite(values)]
-        if finite.size and (np.abs(finite) > limit).mean() > MAX_VIOLATION_FRACTION:
-            return reason
-    return None
+        flags[reason] = bool(finite.size and (np.abs(finite) > limit).mean() > MAX_VIOLATION_FRACTION)
+
+    if cfg.drop_dynamics:
+        for reason in DYNAMICS_FLAGS:
+            if flags[reason]:
+                return reason, flags
+    return None, flags
 
 
 # =============================================================================
@@ -268,6 +369,7 @@ def process_day(date: str, input_path: str, output_dir: str, cfg: ResampleConfig
     reported_all = {c: df[c].to_numpy(dtype=float) for c in reported_cols}
 
     dropped = {reason: 0 for reason in DROP_REASONS}
+    flagged = {name: 0 for name in DYNAMICS_FLAGS}
     dropped_records: List[Dict] = []
     segments_split = 0
     out_frames: List[pd.DataFrame] = []
@@ -322,13 +424,20 @@ def process_day(date: str, input_path: str, output_dir: str, cfg: ResampleConfig
                 lat_s, lon_s, alt_s = lat_i, lon_i, alt_i
 
             # Motion quantities follow the smoothed track (== interpolated
-            # track when smoothing is off), since that's what stage 5 consumes.
+            # track when smoothing is off), since that is the track consumers read.
             speed, accel, accel_vector, turn_rate = compute_motion(t_grid, lat_s, lon_s, cfg.dt_s)
 
-            reason = classify_trajectory(t_grid, speed, accel, turn_rate, cfg)
+            reason, dyn_flags = classify_trajectory(t_grid, speed, accel, turn_rate, cfg)
             if reason is not None:
                 audit(trajectory_id, segment_id, reason, len(t_grid), float(t_grid[-1] - t_grid[0]))
                 continue
+            for name in DYNAMICS_FLAGS:
+                flagged[name] += int(dyn_flags[name])
+
+            # Native-rate dynamics from the raw fixes (pre-interpolation), so
+            # downstream sees true maneuver intensity, not the low-passed grid.
+            raw_speed_max, raw_accel_max, raw_turn_max, n_raw_fixes = raw_dynamics_per_interval(
+                t_grid, t_sub, lat_all[gi], lon_unwrapped)
 
             n = len(t_grid)
             block = {
@@ -350,9 +459,16 @@ def process_day(date: str, input_path: str, output_dir: str, cfg: ResampleConfig
                 "accel_mps2": accel,
                 "accel_vector_mps2": accel_vector,
                 "turn_rate_deg_s": turn_rate,
+                "raw_speed_max_mps": raw_speed_max,
+                "raw_accel_max_mps2": raw_accel_max,
+                "raw_turn_rate_max_deg_s": raw_turn_max,
+                "n_raw_fixes": n_raw_fixes,
+                "raw_update_median_s": float(np.median(np.diff(t_sub))),
+                "exceeds_accel_limit": dyn_flags["accel"],
+                "exceeds_turn_rate_limit": dyn_flags["turn_rate"],
                 # segment_* fields describe the PARENT stage-3 segment
                 # (provenance); trajectory_* fields describe THIS resampled
-                # subsegment and are what downstream stages should use.
+                # subsegment and are the ones consumers should use.
                 "segment_start_time": first_row["segment_start_time"],
                 "segment_end_time": first_row["segment_end_time"],
                 "segment_duration_s": first_row["segment_duration_s"],
@@ -384,17 +500,20 @@ def process_day(date: str, input_path: str, output_dir: str, cfg: ResampleConfig
             "lat_smooth", "lon_smooth", "alt_smooth",
             "is_interpolated",
             "speed_mps", "accel_mps2", "accel_vector_mps2", "turn_rate_deg_s",
+            "raw_speed_max_mps", "raw_accel_max_mps2", "raw_turn_rate_max_deg_s",
+            "n_raw_fixes", "raw_update_median_s",
         ]
         cols += [f"{c}_interp" for c in reported_cols]
         cols += [
             "segment_start_time", "segment_end_time", "segment_duration_s",
             "trajectory_start_time", "trajectory_end_time", "trajectory_duration_s",
             "n_samples", "was_split_by_interp_gap",
+            "exceeds_accel_limit", "exceeds_turn_rate_limit",
         ]
         cols += [c for c in metadata_cols if c != "callsign"]
         df_final = df_final[cols]
 
-    output_name = os.path.basename(input_path)[: -len(INPUT_SUFFIX)] + OUTPUT_SUFFIX
+    output_name = os.path.basename(input_path)[: -len(INPUT_SUFFIX)] + output_suffix(cfg.dt_s)
     output_path = os.path.join(output_dir, output_name)
     df_final.to_csv(output_path, index=False)
 
@@ -427,6 +546,8 @@ def process_day(date: str, input_path: str, output_dir: str, cfg: ResampleConfig
         "dropped_speed": dropped["speed"],
         "dropped_accel": dropped["accel"],
         "dropped_turn_rate": dropped["turn_rate"],
+        "flagged_accel": flagged["accel"],
+        "flagged_turn_rate": flagged["turn_rate"],
         "median_speed_mps": median_speed,
         "p95_speed_mps": p95_speed,
         "median_accel_mps2": median_accel,

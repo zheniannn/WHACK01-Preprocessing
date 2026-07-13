@@ -1,13 +1,21 @@
-"""Entry point: resample stage 3's cleaned trajectory segments onto a
-uniform 10-second grid, producing per-day trajectory CSVs for stage 5.
+"""Stage 4: resample stage 3's cleaned trajectory segments onto a uniform
+time grid (default 10 s), producing per-day trajectory CSVs (rules in
+utils/resample_trajectories.py).
 
-No train/test split, normalization, ML windowing, heading alignment, or ENU
-tensor output happens here -- see utils/resample_trajectories.py for exactly
-what this stage does and does not do.
+Outputs are tagged with the grid spacing (trajectories_10s/, *_10s.csv;
+--dt 4 gives trajectories_4s/, *_4s.csv), so resampling at a radar's actual
+scan period is a fresh run from the stage-3 segments -- never a second
+interpolation of an already-resampled product, which would compound the
+low-pass smoothing.
+
+Accel / turn-rate exceedances FLAG trajectories (exceeds_accel_limit /
+exceeds_turn_rate_limit columns) rather than dropping them, so maneuver-rich
+flights stay in the dataset; pass --drop-dynamics to drop them instead.
 
 Usage:
-    python F01-Preprocessing/scripts/04_resample_trajectories.py
-    python F01-Preprocessing/scripts/04_resample_trajectories.py --dt 5 --smooth
+    python scripts/04_resample_trajectories.py
+    python scripts/04_resample_trajectories.py --dt 5 --smooth
+    python scripts/04_resample_trajectories.py --dt 4   # radar scan period
 """
 
 import argparse
@@ -37,6 +45,7 @@ SUMMARY_COLUMNS = [
     "date", "input_rows", "input_segments", "output_rows", "output_trajectories",
     "segments_split_by_interp_gap",
     "dropped_duration", "dropped_min_points", "dropped_speed", "dropped_accel", "dropped_turn_rate",
+    "flagged_accel", "flagged_turn_rate",
     "median_speed_mps", "p95_speed_mps",
     "median_accel_mps2", "p95_accel_mps2",
     "median_turn_rate_deg_s", "p95_turn_rate_deg_s",
@@ -55,9 +64,12 @@ def parse_args():
                               "(default: this project's data/active/segments).")
     parser.add_argument("--output-dir", type=str, default=None,
                          help="Directory for the trajectory CSVs and summary "
-                              "(default: this project's data/active/trajectories_10s).")
+                              "(default: this project's data/active/trajectories_<dt>s, "
+                              "tagged with the grid spacing).")
     parser.add_argument("--dt", type=float, default=10.0,
-                         help="Grid spacing in seconds (default: 10).")
+                         help="Grid spacing in seconds (default: 10). Set this to the simulated "
+                              "radar's scan period and rerun from the stage-3 segments rather than "
+                              "re-resampling an existing grid.")
     parser.add_argument("--max-interp-gap-s", type=float, default=30.0,
                          help="Never interpolate across a gap longer than this; split instead (default: 30).")
     parser.add_argument("--min-duration-s", type=float, default=300.0,
@@ -68,9 +80,15 @@ def parse_args():
                          help="Drop a trajectory if any sample's speed exceeds this "
                               "(default: ~154.33, i.e. 300 kt -- aligned with stage 3's glitch threshold).")
     parser.add_argument("--max-accel-mps2", type=float, default=10.0,
-                         help="Drop a trajectory if >5%% of samples exceed this |acceleration| (default: 10).")
+                         help="Flag a trajectory (exceeds_accel_limit) if >5%% of samples exceed "
+                              "this |acceleration| (default: 10); drops instead under --drop-dynamics.")
     parser.add_argument("--max-turn-rate-deg-s", type=float, default=6.0,
-                         help="Drop a trajectory if >5%% of samples exceed this |turn rate| (default: 6).")
+                         help="Flag a trajectory (exceeds_turn_rate_limit) if >5%% of samples exceed "
+                              "this |turn rate| (default: 6); drops instead under --drop-dynamics.")
+    parser.add_argument("--drop-dynamics", action="store_true",
+                         help="Drop (rather than flag) trajectories exceeding the accel / turn-rate "
+                              "limits. Off by default: dropping biases the dataset toward benign, "
+                              "steady flight, which is the wrong prior for target-vs-clutter work.")
     parser.add_argument("--smooth", action="store_true",
                          help="Apply a light centered rolling median (window 3) to the "
                               "interpolated positions (default: off).")
@@ -179,10 +197,11 @@ def main() -> None:
         max_accel_mps2=args.max_accel_mps2,
         max_turn_rate_deg_s=args.max_turn_rate_deg_s,
         smooth=args.smooth,
+        drop_dynamics=args.drop_dynamics,
     )
 
     input_dir = args.input_dir or get_segments_dir()
-    output_dir = args.output_dir or get_trajectories_dir()
+    output_dir = args.output_dir or get_trajectories_dir(cfg.dt_s)
     os.makedirs(output_dir, exist_ok=True)
 
     day_files = discover_input_files(input_dir)
@@ -206,6 +225,8 @@ def main() -> None:
         print(f"dropped: speed:                    {result['dropped_speed']}")
         print(f"dropped: acceleration:             {result['dropped_accel']}")
         print(f"dropped: turn rate:                {result['dropped_turn_rate']}")
+        print(f"flagged (kept): acceleration:      {result['flagged_accel']}")
+        print(f"flagged (kept): turn rate:         {result['flagged_turn_rate']}")
         print(f"output path:                       {result['output_file']}")
 
     summary_rows = [{k: v for k, v in r.items() if k in SUMMARY_COLUMNS} for r in day_results]

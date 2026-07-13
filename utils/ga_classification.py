@@ -305,24 +305,24 @@ def classify(df: pd.DataFrame) -> Tuple[pd.Series, Dict[str, int]]:
     """Run the full conventional-GA classification pipeline on df.
 
     Returns (final_mask, stats), where stats has:
-      total_rows, rows_kept_previous, rows_removed_new,
-      rows_removed_bad_icao24, final_rows
+      rows_total, rows_base_match, rows_removed_strict,
+      rows_removed_bad_icao24, rows_kept
     """
     mfr, model, icao = clean_fields(df)
 
     base_mask, brand_masks = build_base_mask(mfr, model)
-    new_exclude = build_strict_exclude_mask(mfr, model, icao, brand_masks)
+    strict_exclude = build_strict_exclude_mask(mfr, model, icao, brand_masks)
 
-    classified_mask = base_mask & ~new_exclude
+    classified_mask = base_mask & ~strict_exclude
 
     hex_ok = valid_icao24_mask(df)
     final_mask = classified_mask & hex_ok
 
     stats = {
-        "total_rows": len(df),
-        "rows_kept_previous": int(base_mask.sum()),
-        "rows_removed_new": int((base_mask & new_exclude).sum()),
+        "rows_total": len(df),
+        "rows_base_match": int(base_mask.sum()),
+        "rows_removed_strict": int((base_mask & strict_exclude).sum()),
         "rows_removed_bad_icao24": int((classified_mask & ~hex_ok).sum()),
-        "final_rows": int(final_mask.sum()),
+        "rows_kept": int(final_mask.sum()),
     }
     return final_mask, stats
