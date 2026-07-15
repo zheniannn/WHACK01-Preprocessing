@@ -12,27 +12,23 @@ Pipeline per day (see process_day):
 """
 
 import os
-import re
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-INPUT_PREFIX = "states_"
+from .common import EARTH_RADIUS_M, MAX_SPEED_MPS, discover_input_files as _discover
+from .common import find_timestamp_column  # re-exported; stage 3 uses it via this module
+
 INPUT_SUFFIX = "_conventionalGA_sorted.csv"
 OUTPUT_SUFFIX = "_conventionalGA_segments.csv"
-DATE_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 CHUNK_SIZE = 500_000
 
 # --- Timestamp / staleness ---------------------------------------------------
-TIMESTAMP_CANDIDATES = ["lastposupdate", "time"]   # lastposupdate preferred (see module docstring)
 FRESHNESS_MAX_LAG_S = 10.0                          # keep only rows where time - lastposupdate <= this
 
 # --- Physical-plausibility thresholds ----------------------------------------
-KNOTS_TO_MPS = 0.514444
-MAX_SPEED_KNOTS = 300.0
-MAX_SPEED_MPS = MAX_SPEED_KNOTS * KNOTS_TO_MPS       # ~154.33 m/s
 MAX_GLITCH_PASSES = 3
 PERSISTENT_VIOLATION_FRACTION = 0.05                 # discard segment if >5% of steps still violate
 
@@ -40,8 +36,6 @@ ALT_MIN_M = -400.0
 ALT_MAX_M = 12000.0
 
 MIN_VELOCITY_MPS = 15.0                              # drops airborne-flagged idling/taxi artifacts
-
-EARTH_RADIUS_M = 6_371_000.0
 
 REQUIRED_BASE_COLUMNS = ["icao24", "lat", "lon", "onground"]
 ALTITUDE_CANDIDATES = ["geoaltitude", "baroaltitude"]  # geoaltitude preferred (GPS-based)
@@ -65,14 +59,6 @@ def haversine_m(lat1, lon1, lat2, lon2):
     a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0) ** 2
     # clip guards against tiny negative values from floating-point rounding at a==0/1
     return 2.0 * EARTH_RADIUS_M * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
-
-
-def find_timestamp_column(columns) -> str:
-    """Return 'lastposupdate' if present (canonical), else 'time'; raise if neither exists."""
-    for candidate in TIMESTAMP_CANDIDATES:
-        if candidate in columns:
-            return candidate
-    raise ValueError(f"Neither 'lastposupdate' nor 'time' present in columns: {list(columns)}")
 
 
 def find_altitude_columns(columns) -> Tuple[Optional[str], Optional[str]]:
@@ -157,8 +143,8 @@ def basic_clean(
     df = df.copy()
 
     n0 = len(df)
-    icao24 = df["icao24"].astype(str).str.strip()
-    has_icao24 = icao24.notna() & (icao24 != "") & (icao24.str.lower() != "nan")
+    icao24 = df["icao24"].astype(str).str.strip()   # NaN becomes the string "nan"
+    has_icao24 = (icao24 != "") & (icao24.str.lower() != "nan")
     df = df[has_icao24]
     log("blank/missing icao24", n0 - len(df), n0)
 
@@ -251,12 +237,32 @@ def assign_segments(df: pd.DataFrame, timestamp_col: str, gap_split_s: float) ->
     segment_start = grouped_time.transform("min")
     segment_end = grouped_time.transform("max")
 
+    # Id format is frozen: downstream repos reference these ids in saved data.
+    # Two same-aircraft segments could collide only by starting within the
+    # same integer second (a sub-second callsign flip) -- never observed.
     df["segment_id"] = df["icao24"].astype(str) + "_" + segment_start.astype("int64").astype(str)
     df["segment_start_time"] = segment_start
     df["segment_end_time"] = segment_end
     df["segment_duration_s"] = segment_end - segment_start
 
     return df
+
+
+def _speed_violations(times: np.ndarray, lats: np.ndarray, lons: np.ndarray,
+                      keep: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Implied-speed check over the currently-kept points.
+
+    Returns (kept_indices, violating_step_mask) -- step i runs from kept
+    point i to kept point i+1, and violates if it implies > MAX_SPEED_MPS.
+    """
+    idx = np.where(keep)[0]
+    if len(idx) < 2:
+        return idx, np.zeros(0, dtype=bool)
+    dt = np.diff(times[idx])
+    dist = haversine_m(lats[idx][:-1], lons[idx][:-1], lats[idx][1:], lons[idx][1:])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        speed = np.where(dt > 0, dist / dt, 0.0)
+    return idx, speed > MAX_SPEED_MPS
 
 
 def _clean_one_segment(times: np.ndarray, lats: np.ndarray, lons: np.ndarray) -> Tuple[np.ndarray, int, float]:
@@ -270,37 +276,26 @@ def _clean_one_segment(times: np.ndarray, lats: np.ndarray, lons: np.ndarray) ->
 
     Returns (keep_mask over the input arrays, points_removed, final_violation_fraction).
     """
-    n = len(times)
-    keep = np.ones(n, dtype=bool)
+    keep = np.ones(len(times), dtype=bool)
     removed = 0
 
-    violation_fraction = 0.0
     for _ in range(MAX_GLITCH_PASSES):
-        idx = np.where(keep)[0]
-        if len(idx) < 2:
+        idx, violating = _speed_violations(times, lats, lons, keep)
+        if not violating.any():
             break
-        dt = np.diff(times[idx])
-        dist = haversine_m(lats[idx][:-1], lons[idx][:-1], lats[idx][1:], lons[idx][1:])
-        with np.errstate(divide="ignore", invalid="ignore"):
-            speed = np.where(dt > 0, dist / dt, 0.0)
-        violating = speed > MAX_SPEED_MPS
-        n_violations = int(violating.sum())
-        violation_fraction = (n_violations / len(violating)) if len(violating) else 0.0
-        if n_violations == 0:
-            break
-
         # participation[i] = how many of the (up to 2) adjacent steps touching
         # local point i are violating
         participation = np.zeros(len(idx))
         participation[:-1] += violating
         participation[1:] += violating
-        worst_local = int(np.argmax(participation))
-        if participation[worst_local] == 0:
-            break  # defensive: shouldn't happen given n_violations > 0
-        keep[idx[worst_local]] = False
+        keep[idx[int(np.argmax(participation))]] = False
         removed += 1
 
-    return keep, removed, violation_fraction
+    # Recompute on the FINAL kept points: the loop can exit immediately after
+    # a removal, so any in-loop fraction would describe the state before it.
+    _, violating = _speed_violations(times, lats, lons, keep)
+    fraction = float(violating.mean()) if len(violating) else 0.0
+    return keep, removed, fraction
 
 
 def remove_glitch_points(df: pd.DataFrame, timestamp_col: str) -> Tuple[pd.DataFrame, int, int]:
@@ -369,22 +364,11 @@ def filter_valid_segments(
 
 
 def discover_input_files(input_dir: str) -> List[Tuple[str, str]]:
-    """Return sorted (date, path) pairs for every states_*_conventionalGA_sorted.csv in input_dir."""
-    results = []
-    for name in sorted(os.listdir(input_dir)):
-        if not (name.startswith(INPUT_PREFIX) and name.endswith(INPUT_SUFFIX)):
-            continue
-        if "_segments" in name:  # belt-and-suspenders; can't happen given the suffix check above
-            continue
-        match = DATE_PATTERN.search(name)
-        if not match:
-            print(f"WARNING: no date pattern found in filename '{name}'; skipping.")
-            continue
-        results.append((match.group(1), os.path.join(input_dir, name)))
-    return results
+    """Sorted (date, path) pairs for every stage-2 sorted-states CSV in input_dir."""
+    return _discover(input_dir, INPUT_SUFFIX)
 
 
-def read_and_freshness_filter(path: str) -> Tuple[pd.DataFrame, int, int]:
+def read_and_freshness_filter(path: str) -> Tuple[pd.DataFrame, int, int, int]:
     """Chunked read with per-chunk freshness filtering (row-independent, so
     it's safe to apply before concatenating -- this keeps peak memory to one
     ~500k-row chunk instead of the whole raw file).
@@ -395,21 +379,25 @@ def read_and_freshness_filter(path: str) -> Tuple[pd.DataFrame, int, int]:
     basic_clean's drops are counted separately (as "rows_after_basic_cleaning").
     Running basic_clean per chunk first would conflate the two counts.
 
-    Returns (concatenated_freshness_filtered_df, rows_input, rows_removed_freshness).
+    Returns (concatenated_freshness_filtered_df, rows_input,
+    rows_removed_freshness, unique_aircraft_input). The aircraft count is
+    taken from the RAW chunks, before any filtering.
     """
     rows_input = 0
     rows_removed_freshness = 0
     kept_chunks = []
+    aircraft_input = set()
 
     for chunk in pd.read_csv(path, chunksize=CHUNK_SIZE, dtype=READ_DTYPE_OVERRIDES, low_memory=False):
         rows_input += len(chunk)
+        aircraft_input.update(chunk["icao24"].astype(str).str.strip())
         chunk, n_removed = freshness_filter(chunk)
         rows_removed_freshness += n_removed
         if not chunk.empty:
             kept_chunks.append(chunk)
 
     combined = pd.concat(kept_chunks, ignore_index=True) if kept_chunks else pd.DataFrame()
-    return combined, rows_input, rows_removed_freshness
+    return combined, rows_input, rows_removed_freshness, len(aircraft_input)
 
 
 def process_day(
@@ -427,9 +415,16 @@ def process_day(
     """
     timestamp_col, geo_col, baro_col = validate_columns(input_path)
 
-    df_fresh, rows_input, rows_removed_freshness = read_and_freshness_filter(input_path)
+    df_fresh, rows_input, rows_removed_freshness, unique_aircraft_input = \
+        read_and_freshness_filter(input_path)
 
-    unique_aircraft_input = int(df_fresh["icao24"].nunique()) if not df_fresh.empty else 0
+    # Defensive: a file carrying only ONE timestamp column skips the freshness
+    # filter, so NaN timestamps could reach here. Real OpenSky exports carry
+    # both columns, making this a no-op in practice.
+    n_before = len(df_fresh)
+    if not df_fresh.empty:
+        df_fresh = df_fresh.dropna(subset=[timestamp_col])
+    rows_removed_freshness += n_before - len(df_fresh)
 
     # Dedup needs a global (not per-chunk) view of (icao24, timestamp).
     # timestamp_col is 'lastposupdate' whenever that column exists.

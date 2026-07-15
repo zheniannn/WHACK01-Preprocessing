@@ -12,11 +12,19 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
-DATE_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})")
+from .common import DATE_PATTERN
+
 EXCLUDE_NAME_PATTERN = re.compile(r"conventionalga|sorted|filtered", re.IGNORECASE)
 CHUNK_SIZE = 250_000
 
+# Snapshot time preferred for SORTING (deliberately the opposite order to
+# stages 3-4's position-time preference -- see common.POSITION_TIME_CANDIDATES).
 TIME_COLUMN_CANDIDATES = ["time", "lastposupdate"]
+
+# Force identifier columns to string on every read: an all-digit-hex chunk
+# (e.g. icao24 "111111") would otherwise be inferred as int64, truncating
+# leading zeros and silently breaking the whitelist match.
+READ_DTYPE_OVERRIDES = {"icao24": str, "callsign": str}
 
 
 def load_whitelist(whitelist_path: str) -> Set[str]:
@@ -27,7 +35,7 @@ def load_whitelist(whitelist_path: str) -> Set[str]:
     if not os.path.exists(whitelist_path):
         raise FileNotFoundError(f"Aircraft whitelist not found: {whitelist_path}")
 
-    whitelist_df = pd.read_csv(whitelist_path, low_memory=False)
+    whitelist_df = pd.read_csv(whitelist_path, dtype={"icao24": str}, low_memory=False)
     if "icao24" not in whitelist_df.columns:
         raise ValueError(f"Whitelist file is missing required column 'icao24': {whitelist_path}")
 
@@ -115,7 +123,7 @@ def filter_state_file(path: str, whitelist: Set[str]) -> Tuple[pd.DataFrame, int
     rows_read = 0
     kept_chunks = []
 
-    for chunk in pd.read_csv(path, chunksize=CHUNK_SIZE, low_memory=False):
+    for chunk in pd.read_csv(path, chunksize=CHUNK_SIZE, dtype=READ_DTYPE_OVERRIDES, low_memory=False):
         rows_read += len(chunk)
         icao24 = chunk["icao24"].astype(str).str.strip().str.lower()
         chunk = chunk[icao24.isin(whitelist)]
@@ -156,6 +164,7 @@ def process_day(date: str, files: List[str], whitelist: Set[str], output_dir: st
     # "time" is preferred; only fall back to "lastposupdate" if "time" never appears.
     sort_column = "time" if "time" in day_df.columns else "lastposupdate"
     if sort_column not in day_df.columns:
+        # Defensive only: validate_state_file guaranteed one of the two exists.
         raise ValueError(f"Neither 'time' nor 'lastposupdate' present in concatenated data for {date}")
 
     icao24_lower = day_df["icao24"].astype(str).str.strip().str.lower()

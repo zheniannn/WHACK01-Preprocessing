@@ -9,10 +9,11 @@ default is a `data/` directory next to the repository):
 
     <data root>/
     ├── archive/               # raw inputs, never modified
-    └── active/                # everything the pipeline writes
-        ├── states/            # stage 2 output
-        ├── segments/          # stage 3 output
-        └── trajectories_10s/  # stage 4 output (dir name follows --dt)
+    ├── active/                # everything the pipeline writes
+    │   ├── states/            # stage 2 output
+    │   ├── segments/          # stage 3 output
+    │   └── trajectories_10s/  # stage 4 output (dir name follows --dt)
+    └── plot/WHACK01-Preprocessing/   # report figures (make_figures.py)
 """
 
 import os
@@ -96,3 +97,10 @@ def get_resample_summary_path(output_dir: str = "") -> str:
 def get_dropped_audit_path(output_dir: str = "") -> str:
     """Dropped-trajectory audit CSV, kept next to the trajectory files."""
     return os.path.join(output_dir or get_trajectories_dir(), "trajectory_resample_dropped.csv")
+
+
+# --- Figures ---
+
+def get_plot_dir() -> str:
+    """Figures directory (isolated under plot/WHACK01-Preprocessing/)."""
+    return os.path.join(get_data_root(), "plot", "WHACK01-Preprocessing")

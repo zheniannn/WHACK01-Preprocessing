@@ -31,44 +31,38 @@ Numerical care taken here, because each mistake silently poisons downstream:
 """
 
 import os
-import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
+from .common import EARTH_RADIUS_M, MAX_SPEED_MPS, discover_input_files as _discover, find_timestamp_column
 from .io import dt_tag
 
-INPUT_PREFIX = "states_"
 INPUT_SUFFIX = "_conventionalGA_segments.csv"
-DATE_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 
 def output_suffix(dt_s: float) -> str:
     """Per-day output filename suffix, tagged with the grid spacing (see io.dt_tag)."""
     return f"_conventionalGA_trajectories_{dt_tag(dt_s)}.csv"
 
-TIMESTAMP_CANDIDATES = ["lastposupdate", "time"]   # lastposupdate preferred, as in stage 3
 
 REQUIRED_COLUMNS = [
     "icao24", "lat", "lon", "alt", "segment_id",
     "segment_start_time", "segment_end_time", "segment_duration_s",
 ]
 
-# Carried through unchanged (one value per trajectory) when the input has them.
-OPTIONAL_METADATA_COLUMNS = [
-    "callsign", "manufacturername", "model", "icaoaircrafttype",
-    "registration", "typecode",
-]
+# Carried through unchanged (one value per trajectory) when the input has it.
+# Only callsign survives the upstream stages: state vectors carry no
+# aircraft-database metadata and stage 2 performs no whitelist join.
+OPTIONAL_METADATA_COLUMNS = ["callsign"]
 
 # Reported ADS-B channels resampled onto the grid (as <name>_interp) when
 # present, so reported values can be cross-checked against derived ones.
 REPORTED_CHANNELS = ["velocity", "heading", "vertrate"]
 
-EARTH_RADIUS_M = 6_371_000.0
-KNOTS_TO_MPS = 0.514444
-MAX_SPEED_MPS_DEFAULT = 300.0 * KNOTS_TO_MPS   # ~154.33; aligned with stage 3's glitch threshold
+MAX_SPEED_MPS_DEFAULT = MAX_SPEED_MPS   # same 300 kt ceiling as stage 3's glitch threshold
 
 # Fraction of samples allowed to violate the accel / turn-rate limits before
 # the whole trajectory is flagged -- or dropped, under cfg.drop_dynamics
@@ -100,26 +94,9 @@ class ResampleConfig:
 # Discovery / validation
 # =============================================================================
 
-def find_timestamp_column(columns) -> str:
-    """Return 'lastposupdate' if present (canonical), else 'time'; raise if neither exists."""
-    for candidate in TIMESTAMP_CANDIDATES:
-        if candidate in columns:
-            return candidate
-    raise ValueError(f"Neither 'lastposupdate' nor 'time' present in columns: {list(columns)}")
-
-
 def discover_input_files(input_dir: str) -> List[Tuple[str, str]]:
-    """Return sorted (date, path) pairs for every stage-3 segments CSV in input_dir."""
-    results = []
-    for name in sorted(os.listdir(input_dir)):
-        if not (name.startswith(INPUT_PREFIX) and name.endswith(INPUT_SUFFIX)):
-            continue
-        match = DATE_PATTERN.search(name)
-        if not match:
-            print(f"WARNING: no date pattern found in filename '{name}'; skipping.")
-            continue
-        results.append((match.group(1), os.path.join(input_dir, name)))
-    return results
+    """Sorted (date, path) pairs for every stage-3 segments CSV in input_dir."""
+    return _discover(input_dir, INPUT_SUFFIX)
 
 
 def validate_columns(path: str) -> Tuple[str, List[str], List[str]]:
@@ -154,7 +131,12 @@ def build_grid(t: np.ndarray, dt_s: float) -> np.ndarray:
 
 def interp_channel(t_grid, t, y) -> np.ndarray:
     """np.interp that tolerates NaNs in y by interpolating over the finite
-    points only (all-NaN or single-point channels come back as all-NaN)."""
+    points only (all-NaN or single-point channels come back as all-NaN).
+
+    Note: np.interp clamps outside the finite span, so a leading/trailing
+    NaN run yields constant edge values rather than NaN. Positions are
+    unaffected (lat/lon/alt are NaN-free after basic_clean); this only
+    touches the reported cross-check channels."""
     y = np.asarray(y, dtype=float)
     ok = np.isfinite(y)
     if ok.sum() < 2:
@@ -243,8 +225,10 @@ def raw_dynamics_per_interval(
     preserve it: for each grid sample i, over the interval
     (t_grid[i-1], t_grid[i]], report the max |speed| / |accel| / |turn rate|
     of the raw inter-fix steps whose midpoint time falls in that interval,
-    plus the raw-fix count. NaN where the interval contains no raw step
-    (i.e. the sample is synthetic -- consistent with is_interpolated).
+    plus the raw-fix count. NaN where the interval contains no raw step --
+    broadly aligned with is_interpolated, though the two use different
+    criteria (step midpoint in interval vs nearest fix within dt/2) and can
+    disagree near interval edges.
 
     Returns (raw_speed_max, raw_accel_max, raw_turn_rate_max, n_raw_fixes).
     """

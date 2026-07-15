@@ -60,37 +60,37 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Resample cleaned conventional-GA trajectory segments onto a uniform time grid.")
     parser.add_argument("--input-dir", type=str, default=None,
-                         help="Directory containing states_*_conventionalGA_segments.csv files "
+                        help="Directory containing states_*_conventionalGA_segments.csv files "
                               "(default: this project's data/active/segments).")
     parser.add_argument("--output-dir", type=str, default=None,
-                         help="Directory for the trajectory CSVs and summary "
+                        help="Directory for the trajectory CSVs and summary "
                               "(default: this project's data/active/trajectories_<dt>s, "
                               "tagged with the grid spacing).")
     parser.add_argument("--dt", type=float, default=10.0,
-                         help="Grid spacing in seconds (default: 10). Set this to the simulated "
+                        help="Grid spacing in seconds (default: 10). Set this to the simulated "
                               "radar's scan period and rerun from the stage-3 segments rather than "
                               "re-resampling an existing grid.")
     parser.add_argument("--max-interp-gap-s", type=float, default=30.0,
-                         help="Never interpolate across a gap longer than this; split instead (default: 30).")
+                        help="Never interpolate across a gap longer than this; split instead (default: 30).")
     parser.add_argument("--min-duration-s", type=float, default=300.0,
-                         help="Minimum resampled trajectory duration in seconds to keep (default: 300).")
+                        help="Minimum resampled trajectory duration in seconds to keep (default: 300).")
     parser.add_argument("--min-points", type=int, default=30,
-                         help="Minimum number of grid samples a trajectory must have to keep (default: 30).")
+                        help="Minimum number of grid samples a trajectory must have to keep (default: 30).")
     parser.add_argument("--max-speed-mps", type=float, default=MAX_SPEED_MPS_DEFAULT,
-                         help="Drop a trajectory if any sample's speed exceeds this "
+                        help="Drop a trajectory if any sample's speed exceeds this "
                               "(default: ~154.33, i.e. 300 kt -- aligned with stage 3's glitch threshold).")
     parser.add_argument("--max-accel-mps2", type=float, default=10.0,
-                         help="Flag a trajectory (exceeds_accel_limit) if >5%% of samples exceed "
+                        help="Flag a trajectory (exceeds_accel_limit) if >5%% of samples exceed "
                               "this |acceleration| (default: 10); drops instead under --drop-dynamics.")
     parser.add_argument("--max-turn-rate-deg-s", type=float, default=6.0,
-                         help="Flag a trajectory (exceeds_turn_rate_limit) if >5%% of samples exceed "
+                        help="Flag a trajectory (exceeds_turn_rate_limit) if >5%% of samples exceed "
                               "this |turn rate| (default: 6); drops instead under --drop-dynamics.")
     parser.add_argument("--drop-dynamics", action="store_true",
-                         help="Drop (rather than flag) trajectories exceeding the accel / turn-rate "
+                        help="Drop (rather than flag) trajectories exceeding the accel / turn-rate "
                               "limits. Off by default: dropping biases the dataset toward benign, "
                               "steady flight, which is the wrong prior for target-vs-clutter work.")
     parser.add_argument("--smooth", action="store_true",
-                         help="Apply a light centered rolling median (window 3) to the "
+                        help="Apply a light centered rolling median (window 3) to the "
                               "interpolated positions (default: off).")
     return parser.parse_args()
 
@@ -129,7 +129,7 @@ def _check_thresholds(day_results: list, min_duration_s: float, min_points: int)
     print(f"  all trajectories >= {min_duration_s}s and >= {min_points} samples: OK")
 
 
-def _check_motion_stats(day_results: list, cfg: ResampleConfig) -> None:
+def _check_motion_stats(day_results: list) -> None:
     """Combined-across-days motion statistics.
 
     The percentile table is REPORT-ONLY: the filters just enforced ~p95
@@ -251,12 +251,14 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("VALIDATION GATE")
     print("=" * 70)
-    if not any(os.path.exists(r["output_file"]) for r in day_results):
-        _fail("no output trajectory file was created")
-    print(f"  output files created: {sum(os.path.exists(r['output_file']) for r in day_results)}")
+    # Every day writes a file even when empty, so check for actual content.
+    days_with_output = sum(r["output_rows"] > 0 for r in day_results)
+    if days_with_output == 0:
+        _fail("every day produced an empty trajectory file")
+    print(f"  days with non-empty output: {days_with_output}/{len(day_results)}")
     _check_uniform_spacing(day_results, cfg.dt_s)
     _check_thresholds(day_results, cfg.min_duration_s, cfg.min_points)
-    _check_motion_stats(day_results, cfg)
+    _check_motion_stats(day_results)
     _spot_check_trajectories(day_results)
 
     print("\n04_resample_trajectories completed successfully.")
