@@ -1,12 +1,16 @@
 # WHACK01-Preprocessing
 
-**OpenSky ADS-B → clean, uniformly-sampled general-aviation ground-truth trajectories.**
+### OpenSky ADS-B → clean, uniformly-sampled general-aviation ground-truth trajectories
+
+*4 survey days · ~460k aircraft screened · streamed 41 GB · Python (numpy · pandas · matplotlib)*
 
 Stages 1–4 of the WHACK pipeline: raw [OpenSky](https://opensky-network.org/) aircraft-database and state-vector CSVs become per-day trajectory files on a uniform 10 s grid — the ground truth that [WHACK02-Radar](https://github.com/zheniannn/WHACK02-Radar) turns into simulated radar measurements for target-vs-clutter discrimination research.
 
 ![Ground-truth coverage](docs/figures/1_coverage_map.png)
 
-Across the four survey days (2022-06-06 / 13 / 20 / 27): **164,592** whitelisted GA aircraft → **19.0 M** filtered state rows → **79,743** flight segments → **82,538** uniform-grid trajectories (**10.4 M** samples).
+> **At a glance** — the funnel across the four survey days (2022-06-06 / 13 / 20 / 27):
+>
+> **460,000** aircraft screened → **164,592** GA whitelist → **19.0 M** filtered state rows → **79,743** flight segments → **82,538** uniform-grid trajectories (**10.4 M** samples). Every stage self-validates and raises on failure; maneuvers are flagged, never dropped.
 
 ## Pipeline
 
